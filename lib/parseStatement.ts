@@ -73,22 +73,34 @@ function parseRowsWithDateAmount(lines: string[]) {
 function parseChecksRows(lines: string[]) {
   const datePattern = String.raw`\d{1,2}\/\d{1,2}(?:\/\d{2,4})?`;
   const amountPattern = String.raw`[\(\-]?\$?[\d,]+\.\d{2}\)?-?`;
-  const rowRegex = new RegExp(`^(${datePattern})\\s+(\\d+)\\s+(${amountPattern})$`);
+  const tripleRegex = new RegExp(`(${datePattern})\\s+(\\d+)\\s+(${amountPattern})`, "g");
 
-  return lines
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter(Boolean)
-    .map((line) => {
-      const match = line.match(rowRegex);
-      if (!match) return null;
-      return {
+  const rows: Array<{ Date: string; "Check #": string; Amount: string; Name: string }> = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\s+/g, " ").trim();
+    if (!line) continue;
+
+    for (const match of line.matchAll(tripleRegex)) {
+      rows.push({
         Date: match[1],
         "Check #": match[2],
         Amount: normalizeAmount(match[3]),
         Name: "",
-      };
-    })
-    .filter((row): row is { Date: string; "Check #": string; Amount: string; Name: string } => !!row);
+      });
+    }
+  }
+
+  rows.sort((left, right) => {
+    const leftNum = parseInt(left["Check #"], 10);
+    const rightNum = parseInt(right["Check #"], 10);
+    if (!Number.isNaN(leftNum) && !Number.isNaN(rightNum) && leftNum !== rightNum) {
+      return leftNum - rightNum;
+    }
+    return left.Date.localeCompare(right.Date);
+  });
+
+  return rows;
 }
 
 const ACCOUNT_SUMMARY_AMOUNT = String.raw`[\(\-]?\$?[\d,]+\.\d{2}\)?-?`;
@@ -342,18 +354,108 @@ function splitSections(lines: string[]): {
   return { sections: output, missingSections };
 }
 
-function mapCheckNamesFromText(fullText: string): Map<string, string> {
-  const map = new Map<string, string>();
-  const checkRegex =
-    /(?:Check\s*#?\s*|CHECK\s*#?\s*)(\d{2,})[\s\S]{0,200}?(?:Pay to the Order of|PAY TO THE ORDER OF)\s+([A-Za-z0-9 ,.'&-]+)/g;
+function cleanCheckPayeeName(value: string): string {
+  return value
+    .replace(/^\W+/, "")
+    .replace(/\s+$/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\b(check|check number|check#)\b.*$/i, "")
+    .replace(/\bdate:.*$/i, "")
+    .replace(/\bamount:.*$/i, "")
+    .trim();
+}
 
-  for (const match of fullText.matchAll(checkRegex)) {
-    const checkNumber = match[1]?.trim();
-    const payee = match[2]?.trim();
-    if (checkNumber && payee && !map.has(checkNumber)) {
-      map.set(checkNumber, payee);
+function isLikelyAmountOrDateLine(line: string): boolean {
+  const normalized = line.trim();
+  if (!normalized) return true;
+  if (/^\d{1,2}\/\d{1,2}(?:\/\d{2,4})?$/.test(normalized)) return true;
+  if (/^[\(\-]?\$?[\d,]+\.\d{2}\)?-?$/.test(normalized)) return true;
+  return false;
+}
+
+function extractCheckImageLines(lines: string[]): string[] {
+  const startIndex = lines.findIndex((line) => /\bcheck\s+images?\b/i.test(line));
+  if (startIndex < 0) return [];
+
+  const extracted: string[] = [];
+  for (let i = startIndex + 1; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const heading = detectSectionHeading(line);
+    if (heading && heading !== "Checks") {
+      break;
+    }
+
+    extracted.push(line);
+  }
+  return extracted;
+}
+
+function mapCheckNamesFromLines(checkImageLines: string[], fullText: string): Map<string, string> {
+  const map = new Map<string, string>();
+  let currentCheckNumber: string | null = null;
+  let waitingForPayee = false;
+
+  for (const rawLine of checkImageLines) {
+    const line = rawLine.replace(/\s+/g, " ").trim();
+    if (!line) continue;
+
+    const lineWithCheck = line.match(/^(\d{2,})\b\s*(.*)$/);
+    if (lineWithCheck) {
+      currentCheckNumber = lineWithCheck[1];
+      waitingForPayee = false;
+      const rest = lineWithCheck[2].trim();
+      if (/pay to the order of/i.test(rest)) {
+        const inlinePayee = rest.replace(/^.*pay to the order of\s*/i, "").trim();
+        const cleanedInline = cleanCheckPayeeName(inlinePayee);
+        if (cleanedInline && !map.has(currentCheckNumber)) {
+          map.set(currentCheckNumber, cleanedInline);
+          currentCheckNumber = null;
+        } else {
+          waitingForPayee = true;
+        }
+      }
+      continue;
+    }
+
+    if (/pay to the order of/i.test(line)) {
+      const inlinePayee = line.replace(/^.*pay to the order of\s*/i, "").trim();
+      const cleanedInline = cleanCheckPayeeName(inlinePayee);
+      if (currentCheckNumber && cleanedInline && !map.has(currentCheckNumber)) {
+        map.set(currentCheckNumber, cleanedInline);
+        currentCheckNumber = null;
+        waitingForPayee = false;
+      } else {
+        waitingForPayee = !!currentCheckNumber;
+      }
+      continue;
+    }
+
+    if (currentCheckNumber && (waitingForPayee || !map.has(currentCheckNumber))) {
+      if (isLikelyAmountOrDateLine(line)) continue;
+      const cleaned = cleanCheckPayeeName(line);
+      if (cleaned) {
+        map.set(currentCheckNumber, cleaned);
+        currentCheckNumber = null;
+        waitingForPayee = false;
+      }
     }
   }
+
+  // Fallback for statements where check-image text is flattened.
+  if (map.size === 0) {
+    const checkRegex =
+      /(?:Check\s*#?\s*|CHECK\s*#?\s*)(\d{2,})[\s\S]{0,240}?(?:Pay to the Order of|PAY TO THE ORDER OF)\s+([A-Za-z0-9 ,.'&-]+)/g;
+    for (const match of fullText.matchAll(checkRegex)) {
+      const checkNumber = match[1]?.trim();
+      const payee = cleanCheckPayeeName(match[2] ?? "");
+      if (checkNumber && payee && !map.has(checkNumber)) {
+        map.set(checkNumber, payee);
+      }
+    }
+  }
+
   return map;
 }
 
@@ -422,7 +524,8 @@ export async function parseStatement(buffer: Buffer): Promise<ParseStatementResu
     warnings.push(`Missing section headers: ${missingSections.join(", ")}.`);
   }
 
-  const checkNamesByNumber = mapCheckNamesFromText(fullText);
+  const checkImageLines = extractCheckImageLines(allLines);
+  const checkNamesByNumber = mapCheckNamesFromLines(checkImageLines, fullText);
   if (checkNamesByNumber.size === 0) {
     warnings.push("Check images section not found - Name column will be empty.");
   }

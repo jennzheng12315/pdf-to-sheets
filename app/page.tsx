@@ -14,7 +14,7 @@ type Stage = "upload" | "labeling" | "success";
 function getDefaultSheetTitle() {
   const now = new Date();
   const previous = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-  return previous.toLocaleString("en-US", { month: "long", year: "numeric" });
+  return "Bank of America " + previous.toLocaleString("en-US", { month: "long", year: "numeric" });
 }
 
 export default function Home() {
