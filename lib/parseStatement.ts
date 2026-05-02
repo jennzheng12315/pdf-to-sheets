@@ -128,17 +128,54 @@ function parseAccountSummaryRows(lines: string[]) {
 function parseDailyLedgerRows(lines: string[]) {
   const datePattern = String.raw`\d{1,2}\/\d{1,2}(?:\/\d{2,4})?`;
   const amountPattern = String.raw`[\(\-]?\$?[\d,]+\.\d{2}\)?-?`;
-  const rowRegex = new RegExp(`^(${datePattern})\\s+(${amountPattern})$`);
+  /** BOA often lays out Daily Ledger as several Date/Balance pairs left-to-right on the same PDF row. */
+  const pairRegexSource = `(${datePattern})\\s+(${amountPattern})`;
 
-  return lines
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter(Boolean)
-    .map((line) => {
-      const match = line.match(rowRegex);
-      if (!match) return null;
-      return { Date: match[1], "Balance ($)": normalizeAmount(match[2]) };
-    })
-    .filter((row): row is { Date: string; "Balance ($)": string } => !!row);
+  function ledgerDateParts(dateStr: string): { y: number; m: number; d: number } {
+    const match = dateStr.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+    if (!match) return { y: 0, m: 0, d: 0 };
+    const month = parseInt(match[1], 10);
+    const day = parseInt(match[2], 10);
+    let year = match[3] ? parseInt(match[3], 10) : 0;
+    if (match[3] && year < 100) year += 2000;
+    return { y: year, m: month, d: day };
+  }
+
+  function compareDailyLedgerDates(a: string, b: string): number {
+    const A = ledgerDateParts(a);
+    const B = ledgerDateParts(b);
+    if (A.y !== 0 && B.y !== 0 && A.y !== B.y) return A.y - B.y;
+    if (A.m !== B.m) return A.m - B.m;
+    return A.d - B.d;
+  }
+
+  const rows: Array<{ Date: string; "Balance ($)": string }> = [];
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+/g, " ").trim();
+    if (!line) continue;
+
+    const lower = line.toLowerCase();
+    if (
+      /^date\b/.test(lower) &&
+      /\bbalance\b/.test(lower) &&
+      !/\d{1,2}\/\d{1,2}/.test(line)
+    ) {
+      continue;
+    }
+
+    const pairRegex = new RegExp(pairRegexSource, "g");
+    for (const match of line.matchAll(pairRegex)) {
+      rows.push({
+        Date: match[1],
+        "Balance ($)": normalizeAmount(match[2]),
+      });
+    }
+  }
+
+  rows.sort((left, right) => compareDailyLedgerDates(left.Date, right.Date));
+
+  return rows;
 }
 
 function getPageLines(
