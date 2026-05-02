@@ -1,6 +1,7 @@
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { ParseStatementResult, ParsedSections, SectionName } from "@/lib/types";
 
+
 const SECTION_HEADERS: SectionName[] = [
   "Account Summary",
   "Deposits and Other Credits",
@@ -47,7 +48,17 @@ class MissingSectionError extends Error {
 function normalizeAmount(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
-  return trimmed.replace(/\s+/g, " ");
+  let cleaned = trimmed.replace(/\s+/g, " ");
+  // Check if it's a negative amount (wrapped in parentheses)
+  const isNegative = /^\(|\)$/.test(cleaned) || cleaned.includes("(");
+  // Remove $, commas, parentheses, and negative signs
+  cleaned = cleaned.replace(/[$,()]/g, "").replace(/-/g, "");
+  // Parse as float and format with 2 decimal places to preserve trailing zeros
+  const num = parseFloat(cleaned);
+  if (Number.isNaN(num)) return "";
+  const result = isNegative ? -Math.abs(num) : num;
+  // Return as string with exactly 2 decimal places
+  return result.toFixed(2);
 }
 
 function parseRowsWithDateAmount(lines: string[]) {
@@ -395,58 +406,68 @@ function extractCheckImageLines(lines: string[]): string[] {
 function mapCheckNamesFromLines(checkImageLines: string[], fullText: string): Map<string, string> {
   const map = new Map<string, string>();
   let currentCheckNumber: string | null = null;
-  let waitingForPayee = false;
 
   for (const rawLine of checkImageLines) {
     const line = rawLine.replace(/\s+/g, " ").trim();
     if (!line) continue;
 
-    const lineWithCheck = line.match(/^(\d{2,})\b\s*(.*)$/);
-    if (lineWithCheck) {
-      currentCheckNumber = lineWithCheck[1];
-      waitingForPayee = false;
-      const rest = lineWithCheck[2].trim();
-      if (/pay to the order of/i.test(rest)) {
-        const inlinePayee = rest.replace(/^.*pay to the order of\s*/i, "").trim();
-        const cleanedInline = cleanCheckPayeeName(inlinePayee);
-        if (cleanedInline && !map.has(currentCheckNumber)) {
-          map.set(currentCheckNumber, cleanedInline);
-          currentCheckNumber = null;
-        } else {
-          waitingForPayee = true;
+    // Check number followed by payee name (common in check images sections)
+    const checkWithPayee = line.match(/^(\d{2,})\b\s+(.+)$/);
+    if (checkWithPayee) {
+      currentCheckNumber = checkWithPayee[1];
+      const potentialPayee = checkWithPayee[2].trim();
+
+      // If the line contains "pay to the order of", extract payee from that
+      if (/pay to the order of/i.test(potentialPayee)) {
+        const payeeMatch = potentialPayee.match(/pay to the order of\s+(.+?)(?:\s+\$|\s+\d{1,2}\/\d{1,2}|$)/i);
+        if (payeeMatch) {
+          const payee = cleanCheckPayeeName(payeeMatch[1]);
+          if (payee) {
+            map.set(currentCheckNumber, payee);
+          }
+        }
+      } else if (!isLikelyAmountOrDateLine(potentialPayee)) {
+        // Otherwise, the rest of the line might be the payee name
+        const payee = cleanCheckPayeeName(potentialPayee);
+        if (payee) {
+          map.set(currentCheckNumber, payee);
         }
       }
       continue;
     }
 
+    // Line with "pay to the order of" but no check number - associate with previous check
     if (/pay to the order of/i.test(line)) {
-      const inlinePayee = line.replace(/^.*pay to the order of\s*/i, "").trim();
-      const cleanedInline = cleanCheckPayeeName(inlinePayee);
-      if (currentCheckNumber && cleanedInline && !map.has(currentCheckNumber)) {
-        map.set(currentCheckNumber, cleanedInline);
-        currentCheckNumber = null;
-        waitingForPayee = false;
-      } else {
-        waitingForPayee = !!currentCheckNumber;
+      const payeeMatch = line.match(/pay to the order of\s+(.+?)(?:\s+\$|\s+\d{1,2}\/\d{1,2}|$)/i);
+      if (payeeMatch && currentCheckNumber && !map.has(currentCheckNumber)) {
+        const payee = cleanCheckPayeeName(payeeMatch[1]);
+        if (payee) {
+          map.set(currentCheckNumber, payee);
+        }
       }
       continue;
     }
 
-    if (currentCheckNumber && (waitingForPayee || !map.has(currentCheckNumber))) {
-      if (isLikelyAmountOrDateLine(line)) continue;
+    // Just a check number on its own line
+    const justCheckNumber = line.match(/^(\d{2,})$/);
+    if (justCheckNumber) {
+      currentCheckNumber = justCheckNumber[1];
+      continue;
+    }
+
+    // If we have a pending check number and this line looks like a payee name
+    if (currentCheckNumber && !map.has(currentCheckNumber) && !isLikelyAmountOrDateLine(line)) {
       const cleaned = cleanCheckPayeeName(line);
       if (cleaned) {
         map.set(currentCheckNumber, cleaned);
-        currentCheckNumber = null;
-        waitingForPayee = false;
       }
     }
   }
 
-  // Fallback for statements where check-image text is flattened.
+  // Fallback: use regex to find check# followed by payee in full text
   if (map.size === 0) {
     const checkRegex =
-      /(?:Check\s*#?\s*|CHECK\s*#?\s*)(\d{2,})[\s\S]{0,240}?(?:Pay to the Order of|PAY TO THE ORDER OF)\s+([A-Za-z0-9 ,.'&-]+)/g;
+      /(?:Check\s*#?\s*|CHECK\s*#?\s*)(\d{2,})[\s\S]{0,200}?(?:Pay to the Order of|PAY TO THE ORDER OF)\s+([A-Za-z0-9 ,.'&-]+)/gi;
     for (const match of fullText.matchAll(checkRegex)) {
       const checkNumber = match[1]?.trim();
       const payee = cleanCheckPayeeName(match[2] ?? "");

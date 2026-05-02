@@ -35,19 +35,54 @@ function applyCategoryColumn(
   });
 }
 
-function toGrid(sectionName: SectionName, sections: ParsedSections, labels: ExportSheetPayload["labels"]) {
+type GridResult = {
+  grid: string[][];
+  hasTotalRow: boolean;
+};
+
+function toGrid(sectionName: SectionName, sections: ParsedSections, labels: ExportSheetPayload["labels"]): GridResult {
   const rows = applyCategoryColumn(
     sectionName,
     sections[sectionName] as Array<Record<string, string>>,
     labels,
   ) as Array<Record<string, string>>;
   if (rows.length === 0) {
-    return [["No data"]];
+    return { grid: [["No data"]], hasTotalRow: false };
   }
 
   const headers = Object.keys(rows[0]);
   const body = rows.map((row) => headers.map((header) => row[header] ?? ""));
-  return [headers, ...body];
+
+  // Add totals for sections with Amount column
+  const sectionsWithTotals: SectionName[] = [
+    "Deposits and Other Credits",
+    "Withdrawals and Other Debits",
+    "Checks",
+    "Service Fees",
+  ];
+
+  let hasTotalRow = false;
+  if (sectionsWithTotals.includes(sectionName)) {
+    const amountColIndex = headers.findIndex((h) => h === "Amount");
+    if (amountColIndex >= 0) {
+      let total = 0;
+      for (const row of body) {
+        const val = parseFloat(row[amountColIndex] ?? "0");
+        if (!Number.isNaN(val)) {
+          total += val;
+        }
+      }
+      // Add empty row and total row
+      const emptyRow = new Array(headers.length).fill("");
+      const totalRow = new Array(headers.length).fill("");
+      totalRow[0] = "TOTAL";
+      totalRow[amountColIndex] = total.toFixed(2);
+      body.push(emptyRow, totalRow);
+      hasTotalRow = true;
+    }
+  }
+
+  return { grid: [headers, ...body], hasTotalRow };
 }
 
 export async function exportToGoogleSheets(accessToken: string, payload: ExportSheetPayload) {
@@ -83,13 +118,19 @@ export async function exportToGoogleSheets(accessToken: string, payload: ExportS
     throw new Error("Failed to create spreadsheet.");
   }
 
+  // Build grids and track which sections have total rows
+  const gridResults = new Map<SectionName, GridResult>();
+  for (const sectionName of SECTION_ORDER) {
+    gridResults.set(sectionName, toGrid(sectionName, payload.sections, payload.labels));
+  }
+
   const updates = SECTION_ORDER.map((sectionName) =>
     sheets.spreadsheets.values.update({
       spreadsheetId,
       range: `${sectionName}!A1`,
       valueInputOption: "USER_ENTERED",
       requestBody: {
-        values: toGrid(sectionName, payload.sections, payload.labels),
+        values: gridResults.get(sectionName)!.grid,
       },
     }),
   );
@@ -102,15 +143,53 @@ export async function exportToGoogleSheets(accessToken: string, payload: ExportS
     ]),
   );
 
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests: SECTION_ORDER.map((sectionName) => ({
+  // Build formatting requests - bold header row and total row (if exists)
+  const formatRequests: Array<{
+    repeatCell: {
+      range: {
+        sheetId: number | undefined;
+        startRowIndex: number;
+        endRowIndex: number;
+      };
+      cell: {
+        userEnteredFormat: {
+          textFormat: { bold: boolean };
+        };
+      };
+      fields: string;
+    };
+  }> = [];
+
+  for (const sectionName of SECTION_ORDER) {
+    const sheetId = sheetIdByName.get(sectionName);
+    const result = gridResults.get(sectionName)!;
+
+    // Bold header row (row 0)
+    formatRequests.push({
+      repeatCell: {
+        range: {
+          sheetId,
+          startRowIndex: 0,
+          endRowIndex: 1,
+        },
+        cell: {
+          userEnteredFormat: {
+            textFormat: { bold: true },
+          },
+        },
+        fields: "userEnteredFormat.textFormat.bold",
+      },
+    });
+
+    // Bold total row (last row) if exists
+    if (result.hasTotalRow) {
+      const totalRowIndex = result.grid.length - 1;
+      formatRequests.push({
         repeatCell: {
           range: {
-            sheetId: sheetIdByName.get(sectionName),
-            startRowIndex: 0,
-            endRowIndex: 1,
+            sheetId,
+            startRowIndex: totalRowIndex,
+            endRowIndex: totalRowIndex + 1,
           },
           cell: {
             userEnteredFormat: {
@@ -119,7 +198,14 @@ export async function exportToGoogleSheets(accessToken: string, payload: ExportS
           },
           fields: "userEnteredFormat.textFormat.bold",
         },
-      })),
+      });
+    }
+  }
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: formatRequests,
     },
   });
 
