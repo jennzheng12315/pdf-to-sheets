@@ -11,8 +11,19 @@ const SECTION_ORDER: SectionName[] = [
   "Daily Ledger Balances",
 ];
 
-function normalizeName(value: string): string {
-  return value.trim().toLowerCase();
+function cleanNameForLabeling(value: string): string {
+  return value
+    .replace(/\bDES:[^\s]+/gi, "")
+    .replace(/\bID:[^\s]+/gi, "")
+    .replace(/\bINDN:[^\s]+/gi, "")
+    .replace(/\bConf#\s*\S+/gi, "")
+    .replace(/\bTRN:[^\s]+/gi, "")
+    .replace(/\bSERVICE\s+REF::[^\s]+/gi, "")
+    .replace(/\bDATE:[^\s]+/gi, "")
+    .replace(/\bTIME:[^\s]+/gi, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 function applyCategoryColumn(
@@ -20,17 +31,14 @@ function applyCategoryColumn(
   rows: Record<string, string>[],
   labels: ExportSheetPayload["labels"],
 ) {
-  if (
-    sectionName !== "Deposits and Other Credits" &&
-    sectionName !== "Withdrawals and Other Debits" &&
-    sectionName !== "Checks"
-  ) {
+  if (sectionName !== "Withdrawals and Other Debits" && sectionName !== "Checks") {
     return rows;
   }
 
   return rows.map((row) => {
     const sourceName = sectionName === "Checks" ? row.Name ?? "" : row.Description ?? "";
-    const category = labels[normalizeName(sourceName)] ?? "";
+    const cleanedName = cleanNameForLabeling(sourceName);
+    const category = labels[cleanedName] ?? "";
     return { ...row, Category: category };
   });
 }

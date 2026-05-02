@@ -496,7 +496,6 @@ function cleanNameForLabeling(value: string): string {
 
 function buildUniqueNames(sections: ParsedSections): string[] {
   const names = [
-    ...sections["Deposits and Other Credits"].map((item) => item.Description),
     ...sections["Withdrawals and Other Debits"].map((item) => item.Description),
     ...sections.Checks.map((item) => item.Name),
   ]
