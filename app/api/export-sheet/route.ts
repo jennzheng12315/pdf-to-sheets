@@ -34,7 +34,21 @@ export async function POST(request: Request) {
       userId: session.user.id,
       timestamp: new Date().toISOString(),
       status: "failed",
+      errorMessage: error instanceof Error ? error.message : "Unknown error",
+      errorName: error instanceof Error ? error.name : "Unknown",
     });
+
+    const message = error instanceof Error ? error.message : "Unknown export error";
+    if (message.toLowerCase().includes("authorization failed")) {
+      return NextResponse.json(
+        {
+          error:
+            "Google authorization expired or missing required scope. Please sign out and sign in again.",
+        },
+        { status: 401 },
+      );
+    }
+
     return NextResponse.json(
       { error: "Unable to export spreadsheet at the moment. Please try again." },
       { status: 500 },

@@ -1,3 +1,4 @@
+import { GaxiosError } from "gaxios";
 import { google } from "googleapis";
 import type { ExportSheetPayload, ParsedSections, SectionName } from "@/lib/types";
 
@@ -56,6 +57,17 @@ export async function exportToGoogleSheets(accessToken: string, payload: ExportS
   const sheets = google.sheets({ version: "v4", auth });
   const drive = google.drive({ version: "v3", auth });
 
+  try {
+    await drive.about.get({ fields: "user(displayName)" });
+  } catch (error) {
+    if (error instanceof GaxiosError) {
+      throw new Error(
+        `Google authorization failed: ${error.response?.status ?? "unknown"} ${error.message}`,
+      );
+    }
+    throw error;
+  }
+
   const created = await sheets.spreadsheets.create({
     requestBody: {
       properties: { title: payload.title },
@@ -108,13 +120,6 @@ export async function exportToGoogleSheets(accessToken: string, payload: ExportS
           fields: "userEnteredFormat.textFormat.bold",
         },
       })),
-    },
-  });
-
-  await drive.files.update({
-    fileId: spreadsheetId,
-    requestBody: {
-      name: payload.title,
     },
   });
 

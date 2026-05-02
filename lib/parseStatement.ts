@@ -14,13 +14,19 @@ const SECTION_HEADERS: SectionName[] = [
 // that does not exist. Pointing to the package worker module avoids that failure.
 GlobalWorkerOptions.workerSrc = "pdfjs-dist/build/pdf.worker.mjs";
 
-const SECTION_PATTERNS: Record<SectionName, RegExp> = {
-  "Account Summary": /account\s+summary/i,
-  "Deposits and Other Credits": /deposits?\s+and\s+other\s+credits?/i,
-  "Withdrawals and Other Debits": /withdrawals?\s+and\s+other\s+debits?/i,
-  Checks: /\bchecks?\b/i,
-  "Service Fees": /service\s+fees?/i,
-  "Daily Ledger Balances": /daily\s+ledger\s+balances?/i,
+const SECTION_PATTERNS: Record<SectionName, RegExp[]> = {
+  "Account Summary": [/^account\s+summary$/i, /\baccount\s+summary\b/i],
+  "Deposits and Other Credits": [
+    /^deposits?\s+and\s+other\s+credits?$/i,
+    /\bdeposits?\b.*\bcredits?\b/i,
+  ],
+  "Withdrawals and Other Debits": [
+    /^withdrawals?\s+and\s+other\s+debits?$/i,
+    /\bwithdrawals?\b.*\bdebits?\b/i,
+  ],
+  Checks: [/^checks?$/i, /^checks?\s+paid$/i],
+  "Service Fees": [/^service\s+fees?$/i, /\bservice\s+fees?\b/i],
+  "Daily Ledger Balances": [/^daily\s+ledger\s+balances?$/i, /\bdaily\s+ledger\s+balances?\b/i],
 };
 
 class MissingSectionError extends Error {
@@ -46,11 +52,15 @@ function normalizeAmount(value: string): string {
 }
 
 function parseRowsWithDateAmount(lines: string[]) {
+  const datePattern = String.raw`\d{1,2}\/\d{1,2}(?:\/\d{2,4})?`;
+  const amountPattern = String.raw`[\(\-]?\$?[\d,]+\.\d{2}\)?-?`;
+  const rowRegex = new RegExp(`^(${datePattern})\\s+(.+?)\\s+(${amountPattern})$`);
+
   return lines
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .map((line) => {
-      const dateMatch = line.match(/^(\d{1,2}\/\d{1,2})\s+(.*)\s+(-?\$?[\d,]+\.\d{2})$/);
+      const dateMatch = line.match(rowRegex);
       if (!dateMatch) return null;
       return {
         Date: dateMatch[1],
@@ -62,11 +72,15 @@ function parseRowsWithDateAmount(lines: string[]) {
 }
 
 function parseChecksRows(lines: string[]) {
+  const datePattern = String.raw`\d{1,2}\/\d{1,2}(?:\/\d{2,4})?`;
+  const amountPattern = String.raw`[\(\-]?\$?[\d,]+\.\d{2}\)?-?`;
+  const rowRegex = new RegExp(`^(${datePattern})\\s+(\\d+)\\s+(${amountPattern})$`);
+
   return lines
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .map((line) => {
-      const match = line.match(/^(\d{1,2}\/\d{1,2})\s+(\d+)\s+(-?\$?[\d,]+\.\d{2})$/);
+      const match = line.match(rowRegex);
       if (!match) return null;
       return {
         Date: match[1],
@@ -90,49 +104,105 @@ function parseAccountSummaryRows(lines: string[]) {
 }
 
 function parseDailyLedgerRows(lines: string[]) {
+  const datePattern = String.raw`\d{1,2}\/\d{1,2}(?:\/\d{2,4})?`;
+  const amountPattern = String.raw`[\(\-]?\$?[\d,]+\.\d{2}\)?-?`;
+  const rowRegex = new RegExp(`^(${datePattern})\\s+(${amountPattern})$`);
+
   return lines
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .map((line) => {
-      const match = line.match(/^(\d{1,2}\/\d{1,2})\s+(-?\$?[\d,]+\.\d{2})$/);
+      const match = line.match(rowRegex);
       if (!match) return null;
       return { Date: match[1], "Balance ($)": normalizeAmount(match[2]) };
     })
     .filter((row): row is { Date: string; "Balance ($)": string } => !!row);
 }
 
-function splitSections(text: string): {
+function getPageLines(items: Array<{ str?: string; transform?: number[] }>): string[] {
+  const lineBuckets = new Map<number, Array<{ x: number; text: string }>>();
+
+  for (const item of items) {
+    const text = item.str?.trim();
+    const transform = item.transform;
+    if (!text || !transform || transform.length < 6) continue;
+    const x = transform[4];
+    const y = transform[5];
+    const yKey = Math.round(y * 2) / 2;
+    const bucket = lineBuckets.get(yKey) ?? [];
+    bucket.push({ x, text });
+    lineBuckets.set(yKey, bucket);
+  }
+
+  return [...lineBuckets.entries()]
+    .sort((a, b) => b[0] - a[0])
+    .map(([, parts]) =>
+      parts
+        .sort((a, b) => a.x - b.x)
+        .map((part) => part.text)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim(),
+    )
+    .filter(Boolean);
+}
+
+function normalizeForHeading(line: string): string {
+  return line
+    .replace(/[|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function detectSectionHeading(line: string): SectionName | null {
+  const normalizedLine = normalizeForHeading(line);
+  if (!normalizedLine) return null;
+
+  // Prevent false positives from "Check Images", row lines, etc.
+  if (
+    normalizedLine.includes("check images") ||
+    normalizedLine.includes("check #") ||
+    normalizedLine.includes("pay to the order of")
+  ) {
+    return null;
+  }
+
+  for (const section of SECTION_HEADERS) {
+    const patterns = SECTION_PATTERNS[section];
+    if (patterns.some((pattern) => pattern.test(normalizedLine))) {
+      return section;
+    }
+  }
+  return null;
+}
+
+function splitSections(lines: string[]): {
   sections: Record<SectionName, string[]>;
   missingSections: SectionName[];
 } {
-  const normalized = text.replace(/\r/g, "");
-  const indexByHeader = SECTION_HEADERS.map((header) => {
-    const regex = SECTION_PATTERNS[header];
-    const match = regex.exec(normalized);
-    return {
-      header,
-      index: match?.index ?? -1,
-      length: match?.[0]?.length ?? header.length,
-    };
-  }).filter((entry) => entry.index >= 0);
-
-  const missingSections = SECTION_HEADERS.filter(
-    (header) => !indexByHeader.some((entry) => entry.header === header),
-  );
-  indexByHeader.sort((a, b) => a.index - b.index);
-
   const output = Object.fromEntries(
     SECTION_HEADERS.map((header) => [header, [] as string[]]),
   ) as Record<SectionName, string[]>;
-  for (let i = 0; i < indexByHeader.length; i += 1) {
-    const start = indexByHeader[i].index + indexByHeader[i].length;
-    const end = i + 1 < indexByHeader.length ? indexByHeader[i + 1].index : normalized.length;
-    output[indexByHeader[i].header] = normalized
-      .slice(start, end)
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
+  const foundSections = new Set<SectionName>();
+
+  let currentSection: SectionName | null = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    const sectionHeading = detectSectionHeading(line);
+    if (sectionHeading) {
+      currentSection = sectionHeading;
+      foundSections.add(sectionHeading);
+      continue;
+    }
+
+    if (!currentSection) continue;
+    output[currentSection].push(line);
   }
+
+  const missingSections = SECTION_HEADERS.filter((section) => !foundSections.has(section));
   return { sections: output, missingSections };
 }
 
@@ -178,21 +248,22 @@ export async function parseStatement(buffer: Buffer): Promise<ParseStatementResu
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
     const textContent = await page.getTextContent();
-    const text = textContent.items
-      .map((item) => {
-        if (!("str" in item)) return "";
-        const value = item.str ?? "";
-        return item.hasEOL ? `${value}\n` : `${value} `;
-      })
-      .join("")
-      .replace(/[ \t]+/g, " ")
-      .replace(/\n{2,}/g, "\n")
-      .trim();
-    pageTexts.push(text);
+    const lineItems = textContent.items
+      .map((item) => ({
+        str: "str" in item ? item.str : "",
+        transform: "transform" in item ? item.transform : undefined,
+      }))
+      .filter((item) => item.str);
+    const lines = getPageLines(lineItems);
+    pageTexts.push(lines.join("\n"));
   }
 
   const fullText = pageTexts.join("\n");
-  const { sections: sectionBlocks, missingSections } = splitSections(fullText);
+  const allLines = fullText
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const { sections: sectionBlocks, missingSections } = splitSections(allLines);
   const warnings: string[] = [];
   if (missingSections.length > 0) {
     warnings.push(`Missing section headers: ${missingSections.join(", ")}.`);
