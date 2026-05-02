@@ -53,7 +53,7 @@ export default function LabelingScreen({
                 onChange={(event) => onLabelChange(name, event.target.value as NameCategory)}
                 className="rounded-md border border-slate-600 bg-slate-800 px-2 py-1 text-sm text-slate-100"
               >
-                <option value="">(blank)</option>
+                <option value=""> </option>
                 <option value="Operation">Operation</option>
                 <option value="Inventory">Inventory</option>
               </select>

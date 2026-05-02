@@ -221,13 +221,27 @@ function mapCheckNamesFromText(fullText: string): Map<string, string> {
   return map;
 }
 
+function cleanNameForLabeling(value: string): string {
+  return value
+    .replace(/\bDES:[^\s]+/gi, "")
+    .replace(/\bID:[^\s]+/gi, "")
+    .replace(/\bINDN:[^\s]+/gi, "")
+    .replace(/\bConf#\s*\S+/gi, "")
+    .replace(/\bTRN:[^\s]+/gi, "")
+    .replace(/\bSERVICE\s+REF::[^\s]+/gi, "")
+    .replace(/\bDATE:[^\s]+/gi, "")
+    .replace(/\bTIME:[^\s]+/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function buildUniqueNames(sections: ParsedSections): string[] {
   const names = [
     ...sections["Deposits and Other Credits"].map((item) => item.Description),
     ...sections["Withdrawals and Other Debits"].map((item) => item.Description),
     ...sections.Checks.map((item) => item.Name),
   ]
-    .map((name) => name.trim())
+    .map((name) => cleanNameForLabeling(name))
     .filter(Boolean);
 
   const deduped = new Map<string, string>();
