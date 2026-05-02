@@ -1,6 +1,59 @@
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { ParseStatementResult, ParsedSections, SectionName } from "@/lib/types";
 
+// Polyfill DOMMatrix for server-side environments (Node.js/Vercel)
+if (typeof globalThis.DOMMatrix === "undefined") {
+  globalThis.DOMMatrix = class DOMMatrix {
+    a: number;
+    b: number;
+    c: number;
+    d: number;
+    e: number;
+    f: number;
+
+    constructor(init?: string | number[]) {
+      if (Array.isArray(init) && init.length >= 6) {
+        [this.a, this.b, this.c, this.d, this.e, this.f] = init;
+      } else {
+        this.a = 1; this.b = 0; this.c = 0; this.d = 1; this.e = 0; this.f = 0;
+      }
+    }
+
+    multiply(other: DOMMatrix): DOMMatrix {
+      return new DOMMatrix([
+        this.a * other.a + this.c * other.b,
+        this.b * other.a + this.d * other.b,
+        this.a * other.c + this.c * other.d,
+        this.b * other.c + this.d * other.d,
+        this.a * other.e + this.c * other.f + this.e,
+        this.b * other.e + this.d * other.f + this.f,
+      ]);
+    }
+
+    translate(tx: number, ty: number): DOMMatrix {
+      return new DOMMatrix([this.a, this.b, this.c, this.d, this.e + tx, this.f + ty]);
+    }
+
+    scale(scaleX: number, scaleY?: number): DOMMatrix {
+      const sy = scaleY ?? scaleX;
+      return new DOMMatrix([this.a * scaleX, this.b * scaleX, this.c * sy, this.d * sy, this.e, this.f]);
+    }
+
+    rotate(angle: number): DOMMatrix {
+      const rad = (angle * Math.PI) / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      return new DOMMatrix([
+        this.a * cos + this.c * sin,
+        this.b * cos + this.d * sin,
+        this.c * cos - this.a * sin,
+        this.d * cos - this.b * sin,
+        this.e,
+        this.f,
+      ]);
+    }
+  } as unknown as typeof globalThis.DOMMatrix;
+}
 
 const SECTION_HEADERS: SectionName[] = [
   "Account Summary",
