@@ -15,9 +15,15 @@ const SECTION_HEADERS: SectionName[] = [
 GlobalWorkerOptions.workerSrc = "pdfjs-dist/build/pdf.worker.mjs";
 
 const SECTION_PATTERNS: Record<SectionName, RegExp[]> = {
-  "Account Summary": [/^account\s+summary$/i, /\baccount\s+summary\b/i],
+  "Account Summary": [
+    /^account\s+summary$/i,
+    /\baccount\s+summary\b/i,
+    /^summary$/i,
+    /\baccount\s+information\b.*\bsummary\b/i,
+  ],
   "Deposits and Other Credits": [
     /^deposits?\s+and\s+other\s+credits?$/i,
+    /^deposits?\s+and\s+ohter\s+credits?$/i,
     /\bdeposits?\b.*\bcredits?\b/i,
   ],
   "Withdrawals and Other Debits": [
@@ -36,13 +42,6 @@ class MissingSectionError extends Error {
     super("Missing required statement sections.");
     this.missingSections = missingSections;
   }
-}
-
-function tokenizeLine(line: string): string[] {
-  return line
-    .split(/\s{2,}|\t+/)
-    .map((segment) => segment.trim())
-    .filter(Boolean);
 }
 
 function normalizeAmount(value: string): string {
@@ -92,15 +91,38 @@ function parseChecksRows(lines: string[]) {
     .filter((row): row is { Date: string; "Check #": string; Amount: string; Name: string } => !!row);
 }
 
+const ACCOUNT_SUMMARY_AMOUNT = String.raw`[\(\-]?\$?[\d,]+\.\d{2}\)?-?`;
+
+/** BOA account summary: label column + amount column; no headers. Amount is last token on the line. */
 function parseAccountSummaryRows(lines: string[]) {
-  return lines
-    .map((line) => tokenizeLine(line))
-    .filter((parts) => parts.length >= 2)
-    .map((parts) => ({
-      Description: parts.slice(0, parts.length - 1).join(" "),
-      Value: normalizeAmount(parts[parts.length - 1]),
-    }))
-    .filter((row) => row.Description && row.Value);
+  const rowEndAmount = new RegExp(`^(.+?)\\s+(${ACCOUNT_SUMMARY_AMOUNT})$`);
+  const amountOnly = new RegExp(`^${ACCOUNT_SUMMARY_AMOUNT}$`);
+
+  const rows: Array<{ Description: string; Value: string }> = [];
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+/g, " ").trim();
+    if (!line) continue;
+
+    const withAmount = line.match(rowEndAmount);
+    if (withAmount) {
+      rows.push({
+        Description: withAmount[1].trim(),
+        Value: normalizeAmount(withAmount[2]),
+      });
+      continue;
+    }
+
+    if (amountOnly.test(line) && rows.length > 0) {
+      rows[rows.length - 1] = {
+        ...rows[rows.length - 1],
+        Value: normalizeAmount(line),
+      };
+      continue;
+    }
+  }
+
+  return rows.filter((row) => row.Description && row.Value);
 }
 
 function parseDailyLedgerRows(lines: string[]) {
@@ -119,7 +141,10 @@ function parseDailyLedgerRows(lines: string[]) {
     .filter((row): row is { Date: string; "Balance ($)": string } => !!row);
 }
 
-function getPageLines(items: Array<{ str?: string; transform?: number[] }>): string[] {
+function getPageLines(
+  items: Array<{ str?: string; transform?: number[] }>,
+  options?: { maxX?: number },
+): string[] {
   const lineBuckets = new Map<number, Array<{ x: number; text: string }>>();
 
   for (const item of items) {
@@ -127,6 +152,7 @@ function getPageLines(items: Array<{ str?: string; transform?: number[] }>): str
     const transform = item.transform;
     if (!text || !transform || transform.length < 6) continue;
     const x = transform[4];
+    if (options?.maxX !== undefined && x > options.maxX) continue;
     const y = transform[5];
     const yKey = Math.round(y * 2) / 2;
     const bucket = lineBuckets.get(yKey) ?? [];
@@ -156,6 +182,11 @@ function normalizeForHeading(line: string): string {
 }
 
 function detectSectionHeading(line: string): SectionName | null {
+  const trimmedLine = line.trim();
+  if (/^\d{1,2}\/\d{1,2}/.test(trimmedLine)) {
+    return null;
+  }
+
   const normalizedLine = normalizeForHeading(line);
   if (!normalizedLine) return null;
 
@@ -177,6 +208,27 @@ function detectSectionHeading(line: string): SectionName | null {
   return null;
 }
 
+/** Sub-rows inside Account Summary reuse the same phrases as detail section titles. */
+const ACCOUNT_SUMMARY_INTERIOR_HEADINGS: SectionName[] = [
+  "Deposits and Other Credits",
+  "Withdrawals and Other Debits",
+  "Checks",
+  "Service Fees",
+];
+
+function isEndingBalanceSummaryLine(line: string): boolean {
+  return /\bending\s+balance\s+on\b/i.test(line);
+}
+
+function isBeginningBalanceSummaryLine(line: string): boolean {
+  return /\bbeginning\s+balance\s+on\b/i.test(line);
+}
+
+function hasTrailingAccountSummaryAmount(line: string): boolean {
+  const compact = line.replace(/\s+/g, " ").trim();
+  return new RegExp(`\\s+${ACCOUNT_SUMMARY_AMOUNT}$`).test(compact);
+}
+
 function splitSections(lines: string[]): {
   sections: Record<SectionName, string[]>;
   missingSections: SectionName[];
@@ -187,11 +239,53 @@ function splitSections(lines: string[]): {
   const foundSections = new Set<SectionName>();
 
   let currentSection: SectionName | null = null;
+  /** After this, "Deposits and Other Credits" etc. are real section headers, not summary sub-rows. */
+  let accountSummaryInteriorClosed = false;
+
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line) continue;
 
     const sectionHeading = detectSectionHeading(line);
+
+    if (sectionHeading === "Account Summary") {
+      currentSection = "Account Summary";
+      accountSummaryInteriorClosed = false;
+      foundSections.add("Account Summary");
+      continue;
+    }
+
+    if (!currentSection && isBeginningBalanceSummaryLine(line)) {
+      currentSection = "Account Summary";
+      accountSummaryInteriorClosed = false;
+      foundSections.add("Account Summary");
+      output["Account Summary"].push(line);
+      continue;
+    }
+
+    if (
+      !currentSection &&
+      sectionHeading &&
+      ACCOUNT_SUMMARY_INTERIOR_HEADINGS.includes(sectionHeading) &&
+      hasTrailingAccountSummaryAmount(line)
+    ) {
+      currentSection = "Account Summary";
+      accountSummaryInteriorClosed = false;
+      foundSections.add("Account Summary");
+      output["Account Summary"].push(line);
+      continue;
+    }
+
+    if (
+      currentSection === "Account Summary" &&
+      !accountSummaryInteriorClosed &&
+      sectionHeading &&
+      ACCOUNT_SUMMARY_INTERIOR_HEADINGS.includes(sectionHeading)
+    ) {
+      output["Account Summary"].push(line);
+      continue;
+    }
+
     if (sectionHeading) {
       currentSection = sectionHeading;
       foundSections.add(sectionHeading);
@@ -199,7 +293,12 @@ function splitSections(lines: string[]): {
     }
 
     if (!currentSection) continue;
+
     output[currentSection].push(line);
+
+    if (currentSection === "Account Summary" && isEndingBalanceSummaryLine(line)) {
+      accountSummaryInteriorClosed = true;
+    }
   }
 
   const missingSections = SECTION_HEADERS.filter((section) => !foundSections.has(section));
@@ -262,13 +361,16 @@ export async function parseStatement(buffer: Buffer): Promise<ParseStatementResu
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
     const textContent = await page.getTextContent();
+    const viewport = page.getViewport({ scale: 1 });
     const lineItems = textContent.items
       .map((item) => ({
         str: "str" in item ? item.str : "",
         transform: "transform" in item ? item.transform : undefined,
       }))
       .filter((item) => item.str);
-    const lines = getPageLines(lineItems);
+    const lines = getPageLines(lineItems, {
+      maxX: pageNumber === 1 ? viewport.width * 0.68 : undefined,
+    });
     pageTexts.push(lines.join("\n"));
   }
 
