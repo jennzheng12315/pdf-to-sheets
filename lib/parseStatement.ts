@@ -11,9 +11,14 @@ const SECTION_HEADERS: SectionName[] = [
   "Daily Ledger Balances",
 ];
 
-// In Next.js server runtime, pdfjs may attempt to auto-resolve a bundled worker path
-// that does not exist. Pointing to the package worker module avoids that failure.
-GlobalWorkerOptions.workerSrc = "pdfjs-dist/build/pdf.worker.mjs";
+// Configure PDF.js worker for Vercel serverless environment
+if (typeof window === 'undefined') {
+  // Server-side: disable worker to avoid bundling issues
+  GlobalWorkerOptions.workerSrc = '';
+} else {
+  // Client-side: use the standard worker
+  GlobalWorkerOptions.workerSrc = "pdfjs-dist/build/pdf.worker.mjs";
+}
 
 const SECTION_PATTERNS: Record<SectionName, RegExp[]> = {
   "Account Summary": [
@@ -513,7 +518,11 @@ function buildUniqueNames(sections: ParsedSections): string[] {
 }
 
 export async function parseStatement(buffer: Buffer): Promise<ParseStatementResult> {
-  const loadingTask = getDocument({ data: new Uint8Array(buffer) });
+  // Use worker-less configuration for server-side environment
+  const loadingTask = getDocument({
+    data: new Uint8Array(buffer),
+    // Worker is disabled via GlobalWorkerOptions.workerSrc = '' above
+  });
   const pdf = await loadingTask.promise;
 
   const pageTexts: string[] = [];
