@@ -1,103 +1,201 @@
-import Image from "next/image";
+"use client";
+
+import { useMemo, useState } from "react";
+import { useSession } from "next-auth/react";
+import LabelingScreen from "@/components/LabelingScreen";
+import SignIn from "@/components/sign-in";
+import SuccessScreen from "@/components/SuccessScreen";
+import UploadZone from "@/components/UploadZone";
+import UserMenu from "@/components/UserMenu";
+import type { NameCategory, ParseStatementResult, ParsedSections } from "@/lib/types";
+
+type Stage = "upload" | "labeling" | "success";
+
+function getDefaultSheetTitle() {
+  const now = new Date();
+  const previous = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  return "Bank of America " + previous.toLocaleString("en-US", { month: "long", year: "numeric" });
+}
 
 export default function Home() {
-  return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm/6 text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-[family-name:var(--font-geist-mono)] font-semibold">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+  const { data: session, status } = useSession();
+  const [file, setFile] = useState<File | null>(null);
+  const [stage, setStage] = useState<Stage>("upload");
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [isParsing, setIsParsing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [sheetUrl, setSheetUrl] = useState("");
+  const [sheetTitle, setSheetTitle] = useState(getDefaultSheetTitle);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [uniqueNames, setUniqueNames] = useState<string[]>([]);
+  const [labels, setLabels] = useState<Record<string, NameCategory>>({});
+  const [sections, setSections] = useState<ParsedSections | null>(null);
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+  const heading = useMemo(
+    () => "Upload a BOA statement and export a labeled Google Sheet in minutes.",
+    [],
+  );
+
+  async function handleParse() {
+    if (!file) {
+      setUploadError("Please choose a PDF file first.");
+      return;
+    }
+    if (file.type !== "application/pdf") {
+      setUploadError("Only PDF files are supported.");
+      return;
+    }
+
+    setUploadError(null);
+    setWarnings([]);
+    setIsParsing(true);
+
+    try {
+      const formData = new FormData();
+      formData.append("statement", file);
+
+      const response = await fetch("/api/parse-statement", {
+        method: "POST",
+        body: formData,
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Failed to parse statement.");
+      }
+
+      const parsed = payload as ParseStatementResult;
+      setSections(parsed.sections);
+      setUniqueNames(parsed.uniqueNames);
+      setWarnings(parsed.warnings);
+      setStage("labeling");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to parse statement.";
+      setUploadError(message);
+    } finally {
+      setIsParsing(false);
+    }
+  }
+
+  async function handleSave() {
+    if (!sections) return;
+
+    setSaveError(null);
+    setIsSaving(true);
+    try {
+      const response = await fetch("/api/export-sheet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: sheetTitle,
+          sections,
+          labels,
+        }),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Failed to export sheet.");
+      }
+
+      setSheetUrl(payload.url);
+      setStage("success");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to save sheet.";
+      setSaveError(message);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  function handleLabelChange(name: string, value: NameCategory) {
+    setLabels((current) => ({
+      ...current,
+      [name.toLowerCase()]: value,
+    }));
+  }
+
+  function resetFlow() {
+    setStage("upload");
+    setFile(null);
+    setUploadError(null);
+    setSaveError(null);
+    setSheetUrl("");
+    setWarnings([]);
+    setUniqueNames([]);
+    setLabels({});
+    setSections(null);
+    setSheetTitle(getDefaultSheetTitle());
+  }
+
+  if (status === "loading") {
+    return <main className="min-h-screen bg-slate-950 p-8 text-slate-200">Loading session...</main>;
+  }
+
+  if (!session?.user) {
+    return (
+      <main className="min-h-screen bg-slate-950 px-6 py-20 text-slate-100">
+        <div className="mx-auto max-w-5xl rounded-3xl border border-slate-700/60 bg-slate-900/60 p-10 shadow-2xl shadow-slate-950/30">
+          <p className="text-sm uppercase tracking-[0.2em] text-cyan-300">BOA to Sheets</p>
+          <h1 className="mt-4 font-[family-name:var(--font-space-grotesk)] text-4xl font-bold leading-tight md:text-5xl">
+            {heading}
+          </h1>
+          <p className="mt-4 max-w-2xl text-slate-300">
+            Securely parse Bank of America statements, classify payees, and generate a spreadsheet in
+            your Google Drive in one flow.
+          </p>
+          <div className="mt-8">
+            <SignIn />
+          </div>
         </div>
       </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
+    );
+  }
+
+  return (
+    <main className="min-h-screen bg-slate-950 px-4 py-6 text-slate-100 md:px-10">
+      <header className="mx-auto mb-8 flex w-full max-w-6xl items-center justify-between">
+        <h1 className="font-[family-name:var(--font-space-grotesk)] text-xl font-bold text-cyan-200">
+          BOA Statement Converter
+        </h1>
+        <UserMenu name={session.user.name ?? "User"} image={session.user.image} />
+      </header>
+
+      <section className="mx-auto flex w-full max-w-6xl justify-center">
+        {stage === "upload" ? (
+          <div className="w-full">
+            <UploadZone
+              file={file}
+              onFileChange={setFile}
+              onSubmit={handleParse}
+              isLoading={isParsing}
+              error={uploadError}
+            />
+            {warnings.length > 0 ? (
+              <div className="mx-auto mt-4 w-full max-w-3xl rounded-xl border border-amber-400/40 bg-amber-400/10 p-3 text-sm text-amber-200">
+                {warnings.join(" ")}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        {stage === "labeling" ? (
+          <LabelingScreen
+            title={sheetTitle}
+            uniqueNames={uniqueNames}
+            labels={labels}
+            isSaving={isSaving}
+            saveError={saveError}
+            onTitleChange={setSheetTitle}
+            onLabelChange={handleLabelChange}
+            onBack={() => setStage("upload")}
+            onSave={handleSave}
           />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
-    </div>
+        ) : null}
+
+        {stage === "success" ? <SuccessScreen sheetUrl={sheetUrl} onReset={resetFlow} /> : null}
+      </section>
+    </main>
   );
 }

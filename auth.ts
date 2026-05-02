@@ -1,0 +1,1 @@
+export { authOptions, getAuthSession } from "@/lib/auth";
