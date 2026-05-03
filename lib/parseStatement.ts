@@ -1,59 +1,5 @@
-import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { getResolvedPDFJS, getDocumentProxy } from "unpdf";
 import type { ParseStatementResult, ParsedSections, SectionName } from "@/lib/types";
-
-// Polyfill DOMMatrix for server-side environments (Node.js/Vercel)
-if (typeof globalThis.DOMMatrix === "undefined") {
-  globalThis.DOMMatrix = class DOMMatrix {
-    a: number;
-    b: number;
-    c: number;
-    d: number;
-    e: number;
-    f: number;
-
-    constructor(init?: string | number[]) {
-      if (Array.isArray(init) && init.length >= 6) {
-        [this.a, this.b, this.c, this.d, this.e, this.f] = init;
-      } else {
-        this.a = 1; this.b = 0; this.c = 0; this.d = 1; this.e = 0; this.f = 0;
-      }
-    }
-
-    multiply(other: DOMMatrix): DOMMatrix {
-      return new DOMMatrix([
-        this.a * other.a + this.c * other.b,
-        this.b * other.a + this.d * other.b,
-        this.a * other.c + this.c * other.d,
-        this.b * other.c + this.d * other.d,
-        this.a * other.e + this.c * other.f + this.e,
-        this.b * other.e + this.d * other.f + this.f,
-      ]);
-    }
-
-    translate(tx: number, ty: number): DOMMatrix {
-      return new DOMMatrix([this.a, this.b, this.c, this.d, this.e + tx, this.f + ty]);
-    }
-
-    scale(scaleX: number, scaleY?: number): DOMMatrix {
-      const sy = scaleY ?? scaleX;
-      return new DOMMatrix([this.a * scaleX, this.b * scaleX, this.c * sy, this.d * sy, this.e, this.f]);
-    }
-
-    rotate(angle: number): DOMMatrix {
-      const rad = (angle * Math.PI) / 180;
-      const cos = Math.cos(rad);
-      const sin = Math.sin(rad);
-      return new DOMMatrix([
-        this.a * cos + this.c * sin,
-        this.b * cos + this.d * sin,
-        this.c * cos - this.a * sin,
-        this.d * cos - this.b * sin,
-        this.e,
-        this.f,
-      ]);
-    }
-  } as unknown as typeof globalThis.DOMMatrix;
-}
 
 const SECTION_HEADERS: SectionName[] = [
   "Account Summary",
@@ -63,15 +9,6 @@ const SECTION_HEADERS: SectionName[] = [
   "Service Fees",
   "Daily Ledger Balances",
 ];
-
-// Configure PDF.js worker for Vercel serverless environment
-if (typeof window === 'undefined') {
-  // Server-side: disable worker to avoid bundling issues
-  GlobalWorkerOptions.workerSrc = '';
-} else {
-  // Client-side: use the standard worker
-  GlobalWorkerOptions.workerSrc = "pdfjs-dist/build/pdf.worker.mjs";
-}
 
 const SECTION_PATTERNS: Record<SectionName, RegExp[]> = {
   "Account Summary": [
@@ -110,7 +47,7 @@ function normalizeAmount(value: string): string {
   // Check if it's a negative amount (wrapped in parentheses)
   const isNegative = /^\(|\)$/.test(cleaned) || cleaned.includes("(");
   // Remove $, commas, parentheses, and negative signs
-  cleaned = cleaned.replace(/[$,()]/g, "").replace(/-/g, "");
+  cleaned = cleaned.replace(/[$,()]/g, "");
   // Parse as float and format with 2 decimal places to preserve trailing zeros
   const num = parseFloat(cleaned);
   if (Number.isNaN(num)) return "";
@@ -142,7 +79,7 @@ function parseRowsWithDateAmount(lines: string[]) {
 function parseChecksRows(lines: string[]) {
   const datePattern = String.raw`\d{1,2}\/\d{1,2}(?:\/\d{2,4})?`;
   const amountPattern = String.raw`[\(\-]?\$?[\d,]+\.\d{2}\)?-?`;
-  const tripleRegex = new RegExp(`(${datePattern})\\s+(\\d+)\\s+(${amountPattern})`, "g");
+  const tripleRegex = new RegExp(`(${datePattern})\\s+(\\d+\\*?)\\s+(${amountPattern})`, "g");
 
   const rows: Array<{ Date: string; "Check #": string; Amount: string; Name: string }> = [];
 
@@ -571,24 +508,25 @@ function buildUniqueNames(sections: ParsedSections): string[] {
 }
 
 export async function parseStatement(buffer: Buffer): Promise<ParseStatementResult> {
-  // Use worker-less configuration for server-side environment
-  const loadingTask = getDocument({
-    data: new Uint8Array(buffer),
-    // Worker is disabled via GlobalWorkerOptions.workerSrc = '' above
-  });
-  const pdf = await loadingTask.promise;
+  // Use unpdf's serverless PDF.js build for coordinate-based text extraction
+  const pdf = await getDocumentProxy(new Uint8Array(buffer));
+  const { getDocument } = await getResolvedPDFJS();
+
+  // Load PDF with unpdf's serverless configuration
+  const loadingTask = getDocument({ data: new Uint8Array(buffer) });
+  const pdfDoc = await loadingTask.promise;
 
   const pageTexts: string[] = [];
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-    const page = await pdf.getPage(pageNumber);
+  for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
+    const page = await pdfDoc.getPage(pageNumber);
     const textContent = await page.getTextContent();
     const viewport = page.getViewport({ scale: 1 });
     const lineItems = textContent.items
-      .map((item) => ({
-        str: "str" in item ? item.str : "",
-        transform: "transform" in item ? item.transform : undefined,
+      .map((item: any) => ({
+        str: item.str ?? "",
+        transform: item.transform,
       }))
-      .filter((item) => item.str);
+      .filter((item: { str: string }) => item.str);
     const lines = getPageLines(lineItems, {
       maxX: pageNumber === 1 ? viewport.width * 0.68 : undefined,
     });
